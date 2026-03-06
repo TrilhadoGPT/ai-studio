@@ -71,6 +71,15 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 if [ -z "${HF_TOKEN:-}" ]; then
+  if [ -r /dev/tty ]; then
+    echo "🔑 HF_TOKEN não definido."
+    read -r -s -p "Digite seu HF_TOKEN (input oculto): " HF_TOKEN < /dev/tty
+    echo
+    export HF_TOKEN
+  fi
+fi
+
+if [ -z "${HF_TOKEN:-}" ]; then
   echo "⚠️ HF_TOKEN não definido."
   echo "   Sem HF_TOKEN, o download automático dos modelos pode falhar."
 fi
