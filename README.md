@@ -11,6 +11,48 @@ Otimizado para **NVIDIA H200 NVL 140GB**, mas adaptável para outras GPUs.
 
 ## 🚀 Deploy Rápido (5 minutos)
 
+### Opção Host (sem Docker) - VPS limpa
+
+```bash
+cd /workspace
+git clone https://github.com/TrilhadoGPT/ai-studio.git
+cd ai-studio
+
+cp .env.example .env
+chmod +x scripts/install_host.sh scripts/start_host.sh scripts/stop_host.sh
+
+# Pede HF_TOKEN no terminal (oculto), instala dependências e baixa FLUX
+ENV_FILE=/workspace/ai-studio/.env ./scripts/install_host.sh
+
+# Sobe API de imagem na 127.0.0.1:8000
+ENV_FILE=/workspace/ai-studio/.env ./scripts/start_host.sh
+
+# Teste local
+curl -s http://127.0.0.1:8000/health
+```
+
+> Para vídeo, ajuste `ENABLE_VIDEO=true` e `DOWNLOAD_LTX=true` no `.env`.
+
+### Onde configurar tokens
+
+- Caminho do arquivo `.env`: `/workspace/ai-studio/.env`
+- Token do Hugging Face: `HF_TOKEN=...`
+- Token do GitHub (para GHCR, opcional em modo host): `GHCR_TOKEN=...`
+
+### Publicar no seu GitHub (novo repositório)
+
+```bash
+cd /workspace/ai-studio
+git checkout -b feat/host-install
+git add .
+git commit -m "feat: host installer + start/stop scripts + flux2 reference conditioning"
+
+# depois de criar repo vazio no seu GitHub:
+git remote remove origin
+git remote add origin https://github.com/SEU_USUARIO/SEU_REPO.git
+git push -u origin feat/host-install
+```
+
 ### Opção 0: Bootstrap em 1 comando (`curl | bash`)
 
 ```bash

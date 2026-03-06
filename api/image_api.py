@@ -9,12 +9,33 @@ import io
 import base64
 import uuid
 import json
+import inspect
 from datetime import datetime
 from typing import Optional, List
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from PIL import Image
+from PIL import Image, ImageOps
 import torch
+
+# Allow loading trusted FP8 checkpoints on PyTorch versions that default to
+# weights_only=True and stricter safe globals.
+try:
+    torch.serialization.add_safe_globals([
+        torch._C.StorageBase,
+        torch.storage._LegacyStorage,
+        torch.storage.TypedStorage,
+        torch.UntypedStorage,
+    ])
+except Exception:
+    pass
+
+_original_torch_load = torch.load
+
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _original_torch_load(*args, **kwargs)
+
+torch.load = _torch_load_compat
 
 # ============================================
 # CONFIGURATION
@@ -36,7 +57,7 @@ pipe = None
 def load_model():
     global pipe
     if pipe is None:
-        from diffusers import FluxPipeline
+        from diffusers import FluxPipeline, Flux2Pipeline
         
         # Detect precision from environment
         precision = os.environ.get("FLUX_PRECISION", "fp8")
@@ -46,7 +67,18 @@ def load_model():
         else:
             torch_dtype = torch.bfloat16
         
-        pipe = FluxPipeline.from_pretrained(
+        pipeline_cls = FluxPipeline
+        model_index_path = os.path.join(MODEL_PATH, "model_index.json")
+        if os.path.exists(model_index_path):
+            try:
+                with open(model_index_path, "r", encoding="utf-8") as f:
+                    model_index = json.load(f)
+                if model_index.get("_class_name") == "Flux2Pipeline":
+                    pipeline_cls = Flux2Pipeline
+            except Exception:
+                pass
+
+        pipe = pipeline_cls.from_pretrained(
             MODEL_PATH,
             torch_dtype=torch_dtype,
         )
@@ -80,6 +112,30 @@ def base64_to_image(b64_string: str) -> Image.Image:
         b64_string = b64_string.split(",")[1]
     image_data = base64.b64decode(b64_string)
     return Image.open(io.BytesIO(image_data))
+
+def compose_reference_canvas(ref_images: List[Image.Image], width: int, height: int) -> Image.Image:
+    """
+    Combine multiple references into a single conditioning canvas.
+    This gives the model a deterministic visual anchor when multi-reference
+    adapters are not explicitly configured.
+    """
+    if len(ref_images) == 1:
+        return ImageOps.fit(ref_images[0].convert("RGB"), (width, height), method=Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
+    count = len(ref_images)
+    cols = 2 if count > 1 else 1
+    rows = (count + cols - 1) // cols
+    cell_w = width // cols
+    cell_h = height // rows
+
+    for idx, ref in enumerate(ref_images):
+        r = idx // cols
+        c = idx % cols
+        fitted = ImageOps.fit(ref.convert("RGB"), (cell_w, cell_h), method=Image.Resampling.LANCZOS)
+        canvas.paste(fitted, (c * cell_w, r * cell_h))
+
+    return canvas
 
 # ============================================
 # API ENDPOINTS
@@ -194,25 +250,49 @@ def generate_multi_reference():
             }), 400
         
         # Process reference images
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
         ref_images = []
+        ref_pil_images = []
         for i, b64 in enumerate(ref_images_b64):
             img = base64_to_image(b64)
             filepath = os.path.join(UPLOAD_DIR, f"ref_{uuid.uuid4().hex[:8]}_{i}.png")
             img.save(filepath)
             ref_images.append(filepath)
-        
-        # TODO: Implement IP-Adapter / ControlNet for multi-reference
-        # For now, use prompt enhancement
+            ref_pil_images.append(img)
+
         enhanced_prompt = f"{prompt} [reference strength: {ref_strength}]"
-        
+        ref_canvas = compose_reference_canvas(ref_pil_images, width, height)
+
         pipeline = load_model()
-        
-        image = pipeline(
-            prompt=enhanced_prompt,
-            width=width,
-            height=height,
-            num_inference_steps=steps,
-        ).images[0]
+        call_params = inspect.signature(pipeline.__call__).parameters
+        pipeline_kwargs = {
+            "prompt": enhanced_prompt,
+            "width": width,
+            "height": height,
+            "num_inference_steps": steps,
+        }
+
+        # Use native image-conditioning when available for stronger identity carry-over.
+        conditioning_mode = "prompt_only_fallback"
+        if "image" in call_params:
+            pipeline_kwargs["image"] = ref_canvas
+            conditioning_mode = "image_conditioning"
+        elif "ip_adapter_image" in call_params:
+            pipeline_kwargs["ip_adapter_image"] = ref_pil_images
+            conditioning_mode = "ip_adapter_image_conditioning"
+
+        try:
+            image = pipeline(**pipeline_kwargs).images[0]
+        except Exception:
+            # Ensure endpoint still works even if the runtime pipeline rejects
+            # conditioning args for the loaded checkpoint.
+            image = pipeline(
+                prompt=enhanced_prompt,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+            ).images[0]
+            conditioning_mode = "prompt_only_fallback"
         
         filepath = save_image(image, "multiref")
         
@@ -220,6 +300,7 @@ def generate_multi_reference():
             "success": True,
             "prompt": prompt,
             "reference_count": len(ref_images),
+            "conditioning_mode": conditioning_mode,
             "image": {
                 "image_base64": image_to_base64(image),
                 "filepath": filepath

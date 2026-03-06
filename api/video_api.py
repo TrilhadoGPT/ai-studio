@@ -18,6 +18,26 @@ from PIL import Image
 import torch
 import numpy as np
 
+# Allow loading trusted FP8 checkpoints on PyTorch versions that default to
+# weights_only=True and stricter safe globals.
+try:
+    torch.serialization.add_safe_globals([
+        torch._C.StorageBase,
+        torch.storage._LegacyStorage,
+        torch.storage.TypedStorage,
+        torch.UntypedStorage,
+    ])
+except Exception:
+    pass
+
+_original_torch_load = torch.load
+
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _original_torch_load(*args, **kwargs)
+
+torch.load = _torch_load_compat
+
 # ============================================
 # CONFIGURATION
 # ============================================
