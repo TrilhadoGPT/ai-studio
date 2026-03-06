@@ -6,6 +6,29 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   SUDO="sudo"
 fi
 
+install_docker_if_possible() {
+  if command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return 1
+  fi
+
+  echo "📦 Docker não encontrado. Tentando instalar via apt..."
+  ${SUDO} apt-get update
+  ${SUDO} apt-get install -y docker.io
+
+  if command -v systemctl >/dev/null 2>&1; then
+    ${SUDO} systemctl enable docker >/dev/null 2>&1 || true
+    ${SUDO} systemctl start docker >/dev/null 2>&1 || true
+  else
+    ${SUDO} service docker start >/dev/null 2>&1 || true
+  fi
+
+  command -v docker >/dev/null 2>&1
+}
+
 if [ -f ".env" ]; then
   set -a
   . ./.env
@@ -30,8 +53,12 @@ UPLOADS_DIR="${UPLOADS_DIR:-${DATA_ROOT}/uploads}"
 LOGS_DIR="${LOGS_DIR:-${DATA_ROOT}/logs}"
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "❌ Docker não encontrado. Instale o Docker antes de continuar."
-  exit 1
+  if ! install_docker_if_possible; then
+    echo "❌ Docker não encontrado e não foi possível instalar automaticamente."
+    echo "   Em algumas VPS (container já isolado), Docker-in-Docker não é suportado."
+    echo "   Nesse caso, suba a instância Vast já usando a imagem final: ${IMAGE}"
+    exit 1
+  fi
 fi
 
 if ! docker info >/dev/null 2>&1; then
