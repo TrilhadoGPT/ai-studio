@@ -11,6 +11,15 @@ Otimizado para **NVIDIA H200 NVL 140GB**, mas adaptável para outras GPUs.
 
 ## 🚀 Deploy Rápido (5 minutos)
 
+### Estado Atual (Mar/2026)
+
+- API de vídeo atualizada para **LTX2Pipeline** (text-to-video) e **LTX2ImageToVideoPipeline** (image-to-video)
+- Suporte a fila assíncrona em memória para vídeo:
+  - `POST /jobs/image-to-video`
+  - `GET /jobs/<job_id>`
+  - `GET /jobs/<job_id>/download`
+- Modo host com opção **video-only** (`ENABLE_IMAGE=false`, `ENABLE_VIDEO=true`)
+
 ### Opção Host (sem Docker) - VPS limpa
 
 ```bash
@@ -21,17 +30,23 @@ cd ai-studio
 cp .env.example .env
 chmod +x scripts/install_host.sh scripts/start_host.sh scripts/stop_host.sh
 
-# Pede HF_TOKEN no terminal (oculto), instala dependências e baixa FLUX
+# Instala dependências host
 ENV_FILE=/workspace/ai-studio/.env ./scripts/install_host.sh
 
-# Sobe API de imagem na 127.0.0.1:8000
+# Exemplo video-only no .env:
+# ENABLE_IMAGE=false
+# ENABLE_VIDEO=true
+# DOWNLOAD_FLUX=false
+# DOWNLOAD_LTX=true
+
+# Sobe APIs habilitadas no .env
 ENV_FILE=/workspace/ai-studio/.env ./scripts/start_host.sh
 
-# Teste local
-curl -s http://127.0.0.1:8000/health
+# Teste local vídeo
+curl -s http://127.0.0.1:8001/health
 ```
 
-> Para vídeo, ajuste `ENABLE_VIDEO=true` e `DOWNLOAD_LTX=true` no `.env`.
+> Em `huggingface_hub>=1.x`, o binário de CLI é `hf` (não `huggingface-cli`).
 
 ### Onde configurar tokens
 
@@ -118,6 +133,17 @@ vastai create instance \
 | `/api/video/image-to-video` | POST | Animar imagem |
 | `/api/video/avatar/animate` | POST | Animar avatar |
 | `/api/video/batch` | POST | Gerar múltiplos vídeos |
+
+### API de Vídeo (Host direto em `:8001`)
+
+| Endpoint | Método | Descrição |
+|----------|--------|-----------|
+| `/health` | GET | Status da API de vídeo |
+| `/generate` | POST | Text-to-video (sincrono) |
+| `/image-to-video` | POST | Image-to-video (sincrono) |
+| `/jobs/image-to-video` | POST | Cria job assíncrono |
+| `/jobs/<job_id>` | GET | Consulta status do job |
+| `/jobs/<job_id>/download` | GET | Baixa MP4 do job |
 
 ## 📝 Exemplos de Uso
 

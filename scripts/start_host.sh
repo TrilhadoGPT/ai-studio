@@ -31,13 +31,18 @@ export PYTHONPATH="${ROOT_DIR}"
 pkill -f 'api.image_api:app' >/dev/null 2>&1 || true
 pkill -f 'api.video_api:app' >/dev/null 2>&1 || true
 
-echo "🚀 Iniciando Image API em 127.0.0.1:8000"
-nohup "${VENV_DIR}/bin/gunicorn" \
-  --bind 127.0.0.1:8000 \
-  --workers "${IMAGE_WORKERS:-1}" \
-  --timeout "${IMAGE_TIMEOUT:-600}" \
-  --threads "${IMAGE_THREADS:-4}" \
-  api.image_api:app > "${ROOT_DIR}/logs/image_api.log" 2>&1 &
+ENABLE_IMAGE="${ENABLE_IMAGE:-true}"
+if [ "${ENABLE_IMAGE}" = "true" ]; then
+  echo "🚀 Iniciando Image API em 127.0.0.1:8000"
+  nohup "${VENV_DIR}/bin/gunicorn" \
+    --bind 127.0.0.1:8000 \
+    --workers "${IMAGE_WORKERS:-1}" \
+    --timeout "${IMAGE_TIMEOUT:-600}" \
+    --threads "${IMAGE_THREADS:-4}" \
+    api.image_api:app > "${ROOT_DIR}/logs/image_api.log" 2>&1 &
+else
+  echo "⏭️ ENABLE_IMAGE=false. Image API não será iniciada."
+fi
 
 ENABLE_VIDEO="${ENABLE_VIDEO:-false}"
 if [ "${ENABLE_VIDEO}" = "true" ]; then
@@ -51,9 +56,11 @@ if [ "${ENABLE_VIDEO}" = "true" ]; then
 fi
 
 sleep 3
-echo "🩺 Health local (imagem):"
-curl -sS http://127.0.0.1:8000/health || true
-echo
+if [ "${ENABLE_IMAGE}" = "true" ]; then
+  echo "🩺 Health local (imagem):"
+  curl -sS http://127.0.0.1:8000/health || true
+  echo
+fi
 
 if [ "${ENABLE_VIDEO}" = "true" ]; then
   echo "🩺 Health local (vídeo):"

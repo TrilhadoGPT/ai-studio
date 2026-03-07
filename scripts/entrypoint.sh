@@ -20,17 +20,22 @@ mkdir -p /app/models/ltx
 echo "📊 Verificando GPU..."
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+HF_CLI="hf"
+if ! command -v "${HF_CLI}" >/dev/null 2>&1; then
+    HF_CLI="huggingface-cli"
+fi
+
 # Download models if not present
 if [ ! -f "/app/models/flux/model_index.json" ] && [ -n "$HF_TOKEN" ]; then
     echo "⬇️ Baixando FLUX.2-dev..."
-    huggingface-cli download black-forest-labs/FLUX.2-dev \
+    "${HF_CLI}" download black-forest-labs/FLUX.2-dev \
         --local-dir /app/models/flux \
         --token $HF_TOKEN
 fi
 
 if [ ! -f "/app/models/ltx/model_index.json" ] && [ -n "$HF_TOKEN" ]; then
     echo "⬇️ Baixando LTX-2..."
-    huggingface-cli download Lightricks/LTX-2 \
+    "${HF_CLI}" download Lightricks/LTX-2 \
         --local-dir /app/models/ltx \
         --token $HF_TOKEN
 fi

@@ -10,6 +10,8 @@ import base64
 import uuid
 import json
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, List
 from flask import Flask, request, jsonify, send_file
@@ -54,12 +56,17 @@ UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/app/uploads")
 # ============================================
 print("🎬 Carregando LTX-2...")
 video_pipe = None
+i2v_pipe = None
 audio_pipe = None
+inference_lock = threading.Lock()
+jobs_lock = threading.Lock()
+job_executor = ThreadPoolExecutor(max_workers=1)
+jobs = {}
 
 def load_video_model():
     global video_pipe
     if video_pipe is None:
-        from diffusers import LTXPipeline
+        from diffusers import LTX2Pipeline
         
         precision = os.environ.get("LTX_PRECISION", "fp8")
         
@@ -70,13 +77,35 @@ def load_video_model():
         else:
             torch_dtype = torch.float16
         
-        video_pipe = LTXPipeline.from_pretrained(
+        video_pipe = LTX2Pipeline.from_pretrained(
             MODEL_PATH,
             torch_dtype=torch_dtype,
         )
         video_pipe.to("cuda")
         
     return video_pipe
+
+def load_image_to_video_model():
+    global i2v_pipe
+    if i2v_pipe is None:
+        from diffusers import LTX2ImageToVideoPipeline
+
+        precision = os.environ.get("LTX_PRECISION", "fp8")
+
+        if precision == "fp8":
+            torch_dtype = torch.float8_e4m3fn
+        elif precision == "bf16":
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float16
+
+        i2v_pipe = LTX2ImageToVideoPipeline.from_pretrained(
+            MODEL_PATH,
+            torch_dtype=torch_dtype,
+        )
+        i2v_pipe.to("cuda")
+
+    return i2v_pipe
 
 # ============================================
 # HELPER FUNCTIONS
@@ -92,7 +121,25 @@ def save_video(frames: List, prefix: str = "ltx", fps: int = 24) -> str:
     os.makedirs(temp_dir, exist_ok=True)
     
     for i, frame in enumerate(frames):
+        if isinstance(frame, torch.Tensor):
+            frame = frame.detach().cpu().numpy()
+
         if isinstance(frame, np.ndarray):
+            # Diffusers LTX-2 may return float arrays in [0, 1].
+            if frame.dtype in (np.float16, np.float32, np.float64):
+                frame = np.nan_to_num(frame, nan=0.0, posinf=1.0, neginf=0.0)
+                # Some pipelines output in [-1, 1], others in [0, 1].
+                if float(frame.min()) < 0.0:
+                    frame = (frame + 1.0) / 2.0
+                frame = np.clip(frame, 0.0, 1.0)
+                frame = (frame * 255.0).astype(np.uint8)
+            elif frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+
+            # Ensure channel-last format for PIL (H, W, C).
+            if frame.ndim == 3 and frame.shape[0] in (1, 3, 4) and frame.shape[-1] not in (1, 3, 4):
+                frame = np.transpose(frame, (1, 2, 0))
+
             img = Image.fromarray(frame)
         else:
             img = frame
@@ -126,6 +173,120 @@ def base64_to_image(b64_string: str) -> Image.Image:
         b64_string = b64_string.split(",")[1]
     image_data = base64.b64decode(b64_string)
     return Image.open(io.BytesIO(image_data))
+
+def align_dimension_to_32(value: int) -> int:
+    """LTX-2 expects width/height divisible by 32."""
+    return max(32, (int(value) // 32) * 32)
+
+def align_frames_to_8n_plus_1(value: int) -> int:
+    """LTX-2 expects num_frames following 8n+1."""
+    value = max(9, int(value))
+    if (value - 1) % 8 == 0:
+        return value
+    return ((value - 1 + 7) // 8) * 8 + 1
+
+def run_image_to_video_generation(image_b64: str, prompt: str, duration: float, fps: int, motion_strength: float):
+    """Run image-to-video inference and return generation metadata."""
+    input_image = base64_to_image(image_b64)
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    upload_path = os.path.join(UPLOAD_DIR, f"img2vid_{uuid.uuid4().hex[:8]}.png")
+    input_image.save(upload_path)
+
+    pipeline = load_image_to_video_model()
+
+    num_frames = align_frames_to_8n_plus_1(duration * fps)
+    target_width = align_dimension_to_32(input_image.width)
+    target_height = align_dimension_to_32(input_image.height)
+    input_image = input_image.convert("RGB").resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    with inference_lock:
+        output = pipeline(
+            image=input_image,
+            prompt=prompt,
+            width=target_width,
+            height=target_height,
+            num_frames=num_frames,
+            frame_rate=float(fps),
+            num_inference_steps=28,
+            guidance_scale=max(1.0, 1.0 + float(motion_strength) * 3.0),
+            noise_scale=float(motion_strength),
+            output_type="pil",
+        )
+
+    frames = output.frames[0]
+    video_path = save_video(frames, prefix="img2vid", fps=fps)
+
+    return {
+        "prompt": prompt,
+        "source_image": upload_path,
+        "video": {
+            "filepath": video_path,
+            "duration": duration,
+            "fps": fps,
+            "frames": num_frames,
+            "width": target_width,
+            "height": target_height,
+        },
+    }
+
+def build_job_urls(job_id: str):
+    base = request.host_url.rstrip("/")
+    return {
+        "status_url": f"{base}/jobs/{job_id}",
+        "download_url": f"{base}/jobs/{job_id}/download",
+    }
+
+def submit_image_to_video_job(payload: dict):
+    image_b64 = payload.get("image")
+    prompt = payload.get("prompt", "")
+    duration = float(payload.get("duration", 4))
+    fps = int(payload.get("fps", 24))
+    motion_strength = float(payload.get("motion_strength", 0.7))
+
+    if not image_b64:
+        raise ValueError("image é obrigatório")
+
+    job_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat() + "Z"
+    job_record = {
+        "id": job_id,
+        "type": "image-to-video",
+        "status": "queued",
+        "created_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+        "result": None,
+    }
+
+    def worker():
+        with jobs_lock:
+            jobs[job_id]["status"] = "processing"
+            jobs[job_id]["started_at"] = datetime.utcnow().isoformat() + "Z"
+        try:
+            result = run_image_to_video_generation(
+                image_b64=image_b64,
+                prompt=prompt,
+                duration=duration,
+                fps=fps,
+                motion_strength=motion_strength,
+            )
+            with jobs_lock:
+                jobs[job_id]["status"] = "completed"
+                jobs[job_id]["finished_at"] = datetime.utcnow().isoformat() + "Z"
+                jobs[job_id]["result"] = result
+        except Exception as exc:
+            with jobs_lock:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["finished_at"] = datetime.utcnow().isoformat() + "Z"
+                jobs[job_id]["error"] = str(exc)
+
+    with jobs_lock:
+        jobs[job_id] = job_record
+    job_executor.submit(worker)
+
+    return job_id
 
 # ============================================
 # API ENDPOINTS
@@ -186,9 +347,11 @@ def generate_video():
             width=width,
             height=height,
             num_frames=num_frames,
+            frame_rate=float(fps),
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             generator=generator,
+            output_type="pil",
         )
         
         frames = output.frames[0]
@@ -242,49 +405,96 @@ def image_to_video():
         duration = data.get("duration", 4)  # seconds
         fps = data.get("fps", 24)
         motion_strength = data.get("motion_strength", 0.7)
-        
-        # Decode input image
-        input_image = base64_to_image(image_b64)
-        
-        # Save uploaded image
-        upload_path = os.path.join(UPLOAD_DIR, f"img2vid_{uuid.uuid4().hex[:8]}.png")
-        input_image.save(upload_path)
-        
-        # Load model
-        pipeline = load_video_model()
-        
-        num_frames = duration * fps
-        
-        # Generate video from image
-        output = pipeline(
+        result = run_image_to_video_generation(
+            image_b64=image_b64,
             prompt=prompt,
-            image=input_image,
-            width=input_image.width,
-            height=input_image.height,
-            num_frames=num_frames,
-            num_inference_steps=28,
-            strength=motion_strength,
+            duration=float(duration),
+            fps=int(fps),
+            motion_strength=float(motion_strength),
         )
-        
-        frames = output.frames[0]
-        video_path = save_video(frames, prefix="img2vid", fps=fps)
-        
+
         return jsonify({
             "success": True,
-            "prompt": prompt,
-            "source_image": upload_path,
+            "prompt": result["prompt"],
+            "source_image": result["source_image"],
             "video": {
-                "filepath": video_path,
-                "video_base64": video_to_base64(video_path),
-                "duration": duration,
-                "fps": fps,
-                "frames": num_frames
+                "filepath": result["video"]["filepath"],
+                "video_base64": video_to_base64(result["video"]["filepath"]),
+                "duration": result["video"]["duration"],
+                "fps": result["video"]["fps"],
+                "frames": result["video"]["frames"],
+                "width": result["video"]["width"],
+                "height": result["video"]["height"],
             }
         })
         
     except Exception as e:
         import traceback
         return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+@app.route("/jobs/image-to-video", methods=["POST"])
+def enqueue_image_to_video():
+    """Create async image-to-video job and return a key for polling."""
+    try:
+        payload = request.json or {}
+        job_id = submit_image_to_video_job(payload)
+        urls = build_job_urls(job_id)
+        return jsonify({
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            **urls,
+        }), 202
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+@app.route("/jobs/<job_id>", methods=["GET"])
+def get_job_status(job_id: str):
+    """Check if async generation is queued, processing, completed or failed."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"success": False, "error": "job_id não encontrado"}), 404
+
+    response = {
+        "success": True,
+        "job_id": job_id,
+        "type": job["type"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "error": job["error"],
+    }
+    response.update(build_job_urls(job_id))
+
+    if job["status"] == "completed" and job["result"]:
+        response["video"] = {
+            "filepath": job["result"]["video"]["filepath"],
+            "duration": job["result"]["video"]["duration"],
+            "fps": job["result"]["video"]["fps"],
+            "frames": job["result"]["video"]["frames"],
+            "width": job["result"]["video"]["width"],
+            "height": job["result"]["video"]["height"],
+        }
+
+    return jsonify(response), 200
+
+@app.route("/jobs/<job_id>/download", methods=["GET"])
+def download_job_video(job_id: str):
+    """Download generated MP4 when async job is completed."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"success": False, "error": "job_id não encontrado"}), 404
+    if job["status"] != "completed":
+        return jsonify({"success": False, "status": job["status"], "error": "job ainda não concluído"}), 409
+
+    video_path = job["result"]["video"]["filepath"]
+    if not os.path.exists(video_path):
+        return jsonify({"success": False, "error": "arquivo de vídeo não encontrado"}), 404
+
+    return send_file(video_path, mimetype="video/mp4", as_attachment=False, download_name=os.path.basename(video_path))
 
 @app.route("/avatar/animate", methods=["POST"])
 def animate_avatar():

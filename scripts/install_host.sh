@@ -67,36 +67,48 @@ mkdir -p \
   "${ROOT_DIR}/models/flux" \
   "${ROOT_DIR}/models/ltx"
 
-if [ -z "${HF_TOKEN:-}" ] && [ -r /dev/tty ]; then
+if [ -z "${HF_TOKEN:-}" ] && [ -t 0 ]; then
   echo "🔑 Informe seu HF_TOKEN (input oculto):"
-  read -r -s HF_TOKEN < /dev/tty
+  read -r -s HF_TOKEN
   echo
 fi
 
 if [ -n "${HF_TOKEN:-}" ]; then
+  HF_CLI="${VENV_DIR}/bin/hf"
+  if [ ! -x "${HF_CLI}" ]; then
+    HF_CLI="${VENV_DIR}/bin/huggingface-cli"
+  fi
+
   if grep -q '^HF_TOKEN=' "${ENV_PATH}" 2>/dev/null; then
     sed -i "s|^HF_TOKEN=.*|HF_TOKEN=${HF_TOKEN}|" "${ENV_PATH}"
   else
     echo "HF_TOKEN=${HF_TOKEN}" >> "${ENV_PATH}"
   fi
 
-  if [ ! -f "${ROOT_DIR}/models/flux/model_index.json" ]; then
+  DOWNLOAD_FLUX="${DOWNLOAD_FLUX:-true}"
+  if [ "${DOWNLOAD_FLUX}" = "true" ] && [ ! -f "${ROOT_DIR}/models/flux/model_index.json" ]; then
     echo "⬇️ Baixando FLUX.2-dev..."
-    "${VENV_DIR}/bin/huggingface-cli" download \
+    "${HF_CLI}" download \
       black-forest-labs/FLUX.2-dev \
       --local-dir "${ROOT_DIR}/models/flux" \
       --token "${HF_TOKEN}"
-  else
+  elif [ -f "${ROOT_DIR}/models/flux/model_index.json" ]; then
     echo "✅ FLUX já presente em ${ROOT_DIR}/models/flux"
+  else
+    echo "⏭️ DOWNLOAD_FLUX=false. Ignorando download de FLUX."
   fi
 
   DOWNLOAD_LTX="${DOWNLOAD_LTX:-false}"
   if [ "${DOWNLOAD_LTX}" = "true" ] && [ ! -f "${ROOT_DIR}/models/ltx/model_index.json" ]; then
     echo "⬇️ Baixando LTX-2..."
-    "${VENV_DIR}/bin/huggingface-cli" download \
+    "${HF_CLI}" download \
       Lightricks/LTX-2 \
       --local-dir "${ROOT_DIR}/models/ltx" \
       --token "${HF_TOKEN}"
+  elif [ -f "${ROOT_DIR}/models/ltx/model_index.json" ]; then
+    echo "✅ LTX já presente em ${ROOT_DIR}/models/ltx"
+  else
+    echo "⏭️ DOWNLOAD_LTX=false. Ignorando download de LTX-2."
   fi
 else
   echo "⚠️ HF_TOKEN não definido. O download automático de modelos foi ignorado."
